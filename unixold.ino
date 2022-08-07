@@ -7,8 +7,8 @@ RTC_DS3231 rtc;
 
 // multiplex registers
 int latchPin = 8;
-int clockPin = 12;
-int dataPin = 11;
+int clockPin = A2;
+int dataPin = A3;
 int OE = 6;
 
 // segment register
