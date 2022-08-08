@@ -41,14 +41,7 @@ volatile int modePressed = 0;
 volatile int modeCD = 0;
 int stspp = 0;
 
-#ifdef AUTOSLEEP
-volatile int sleepCount = 0;
-volatile int sleepPending = 0;
-#endif
-
 void setup () {
-
-  
   // multiplex shift register pins
   pinMode(latchPin, OUTPUT);
   pinMode(clockPin, OUTPUT);
@@ -81,19 +74,18 @@ void setup () {
   pinMode(dataPin, INPUT);
   Serial.begin(19200);
 
-    lamptest();
+  lamptest();
 
   noInterrupts();
   attachInterrupt(digitalPinToInterrupt(mode), modeChange, FALLING);
   attachInterrupt(digitalPinToInterrupt(3), khz, RISING);
   interrupts();
 
-
   // if rtc does not start, halt
   if (! rtc.begin()) {
     Serial.println("rtc not found");
     while (1);
-    
+
   }
   if (EEPROM.read(4) == 0)
   {
@@ -123,52 +115,22 @@ void setup () {
     dispMode = 0;
   }
 
-  // run quick lamp test
-  //lamptest();
-
-#ifdef AUTOSLEEP
-  // setup timer for auto sleep
-  noInterrupts();           // disable all interrupts
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCNT1  = 0;
-  OCR1A = 62500;            // compare match register
-  TCCR1B |= (1 << WGM12);   // CTC mode
-  TCCR1B |= (1 << CS12) | (1 << CS10);    // 1024 prescaler
-  TIMSK1 |= (1 << OCIE1A);  // enable timer compare interrupt
-  interrupts();             // enable all interrupts
-  TCNT1  = 0;
-  sleepCount = 0;
-#endif
 }
 
 void modeChange()
 {
-#ifdef AUTOSLEEP
-  if (sleepPending) {
-    sleepPending = 0;
+  if (!modePressed) {
+    //Serial.write("modepressed\n");
+
+    if (dispMode == 4) {
+      //reset = 1;
+      dispMode = 0;
+    } else {
+      dispMode++;
+    }
     modePressed = 1;
     modeCD = 25;
-  } else
-#endif
-    if (!modePressed)
-    {
-      //Serial.write("modepressed\n");
-
-      if (dispMode == 4)
-      {
-        //reset = 1;
-        dispMode = 0;
-      } else {
-        dispMode++;
-      }
-      modePressed = 1;
-      modeCD = 25;
-    }
-#ifdef AUTOSLEEP
-  TCNT1  = 0;
-  sleepCount = 0;
-#endif
+  }
 }
 
 int lookup(int i)
@@ -259,7 +221,6 @@ void startStop()
 {
   if (stopping == 0)
   {
-    Serial.println("here");
     stopping = 1;
     //rtc.writeSqwPinMode(DS3231_SquareWave1Hz);
     //rtc.writeSqwPinMode(DS3231_SquareWave1kHz);
@@ -348,7 +309,6 @@ void displayMMDDYYYY(DateTime n)
   flash();
   pulse();
 
-
   digitalWrite(latch2, LOW);
   shiftOut(data2, clock2, LSBFIRST, lookupHex('-'));
   digitalWrite(latch2, HIGH);
@@ -410,11 +370,12 @@ void khz() {
   millies++;
   if (millies % 32000 == 0)
   {
-    Serial.println(stp);
+    //Serial.println(stp);
     stp++;
     millies = 0;
   }
 }
+
 void displayNum(uint32_t t)
 {
   int x = 9;
@@ -435,9 +396,6 @@ void displayNum(uint32_t t)
     flash();
     pulse();
   }
-
-
-
 }
 
 void displayStop()
@@ -462,7 +420,7 @@ void displayStop()
 
     pulse();
   }
-  Serial.println(millies / 320);
+  //Serial.println(millies / 320);
   shiftData(lookup(millies / 3200));
   flash();
   pulse();
@@ -486,21 +444,6 @@ void lamptest() {
   }
 }
 
-#ifdef AUTOSLEEP
-// sleep interrupt
-ISR(TIMER1_COMPA_vect)          // timer compare interrupt service routine
-{
-  if (sleepCount < 2)
-  {
-    sleepCount++;
-  } else {
-    sleepPending = 1;
-    sleepCount = 0;
-  }
-}
-#endif
-
-
 void loop () {
   DateTime now = rtc.now();
   //Serial.println(now.unixtime());
@@ -523,28 +466,22 @@ void loop () {
       dispMode = 0;
       reset = 0;
     }
-    if (digitalRead(4) == LOW)
-    {
-      if (!stspp)
-      {
+    if (digitalRead(4) == LOW) {
+      if (!stspp) {
         startStop();
         stspp = 1;
         wait = 20;
       }
     }
-    if (stspp)
-    {
+    if (stspp) {
       wait--;
     }
     if (wait == 0)
       stspp = 0;
 
-
-
     displayStop();
-
   }
-  //Serial.println(stp);
+
   if (modePressed)
   {
     modeCD--;
@@ -552,17 +489,4 @@ void loop () {
   if (modeCD == 0) {
     modePressed = 0;
   }
-
-#ifdef AUTOSLEEP
-  if (sleepPending) {
-    uint32_t junkunix = now.unixtime();
-    for (int i = 0; i < 4; i++)
-    {
-      EEPROM.write(i, junkunix & 255);
-      junkunix >>= 8;
-    }
-    LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
-
-  }
-#endif
 }
