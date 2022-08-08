@@ -1,8 +1,7 @@
 // Date and time functions using a DS3231 RTC connected via I2C and Wire lib
 #include "RTClib.h"
-//#include "LowPower.h"
 #include "EEPROM.h"
-//#define AUTOSLEEP
+#include <avr/sleep.h>
 RTC_DS3231 rtc;
 
 // multiplex registers
@@ -40,6 +39,12 @@ volatile int reset = 0;
 volatile int modePressed = 0;
 volatile int modeCD = 0;
 int stspp = 0;
+
+#define CLOCK_SPEED 16000000
+
+// auto sleep
+volatile int secs = 0;
+bool sleep = false;
 
 void setup () {
   // multiplex shift register pins
@@ -115,11 +120,78 @@ void setup () {
     dispMode = 0;
   }
 
+  // auto sleep
+
+  // setup lowest sleep as default
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+
+  // stop interrupts
+  cli();
+
+  // clear registers
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCCR1C = 0;
+
+
+  // set compare register
+  // number of /1024 pulses for 1HZ
+  OCR1A = ( CLOCK_SPEED / (1024 * 1) ) - 1;
+
+  // turn on CTC mode
+  TCCR1B |= 1 << WGM12;
+
+  // set prescaler to slow (/1024)
+  TCCR1B |= 1 << CS10;
+  //TCCR1B |= 1 << CS11;
+  TCCR1B |= 1 << CS12;
+
+  // reset timer
+  TCNT1 = 0;
+
+  // enable cmp interrupt
+  TIMSK1 |= 1 << OCIE1A;
+
+  // reenable interrupts
+  sei();
+}
+
+// auto sleep
+// handle cmp interuppt
+ISR(TIMER1_COMPA_vect) {
+  secs++;
+
+  // sleep after 30 secs
+  if (secs > 9) {
+    secs = 0;
+
+    // reset the LCDs
+    lampclear();
+
+    // sleep
+    noInterrupts();          // make sure we don't get interrupted before we sleep
+    sleep_enable();          // enables the sleep bit in the mcucr register
+    sleep = true;           // set so we know to not change the mode
+    modePressed = 1; // debounce
+    modeCD = 25;
+    interrupts();           // interrupts allowed now, next instruction WILL be executed
+    sleep_cpu();            // here the device is put to sleep
+  }
 }
 
 void modeChange()
 {
+  // if sleeping, wakeup
+  sleep_disable();
+
+  // don't change the mode if awaking
+  if (sleep == true) {
+    sleep = false;
+    return;
+  }
+  
   if (!modePressed) {
+    secs = 0;
     //Serial.write("modepressed\n");
 
     if (dispMode == 4) {
@@ -437,6 +509,23 @@ void lamptest() {
       digitalWrite(OE, HIGH);
       digitalWrite(latch2, LOW);
       shiftOut(data2, clock2, LSBFIRST, 0);
+      digitalWrite(latch2, HIGH);
+      flash();
+      pulse();
+    }
+  }
+}
+
+void lampclear() {
+  //Serial.println("lamp testing...");
+  for (int i = 0; i < 200; i++)
+  {
+    for (int x = 0; x < 10; x++)
+    {
+      //Serial.println(lookup(unix[i]));
+      digitalWrite(OE, HIGH);
+      digitalWrite(latch2, LOW);
+      shiftOut(data2, clock2, LSBFIRST, 0xFF);
       digitalWrite(latch2, HIGH);
       flash();
       pulse();
