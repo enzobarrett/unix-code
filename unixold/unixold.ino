@@ -1,8 +1,12 @@
 // Date and time functions using a DS3231 RTC connected via I2C and Wire lib
 #include "RTClib.h"
 #include "EEPROM.h"
+#include <Timezone.h>    // https://github.com/JChristensen/Timezone
 #include <avr/sleep.h>
-RTC_DS3231 rtc;
+#include <RV-3028-C7.h>
+RV3028 rtc;
+
+#define NOP __asm__ __volatile__ ("nop\n\t")
 
 // multiplex registers
 int latchPin = 8;
@@ -15,6 +19,8 @@ int latch2 = 7;
 int clock2 = 10;
 int data2  = 9;
 
+// sqw pin
+int swp = 3;
 // startstop pin
 int ststp = 4;
 // mode pin
@@ -40,6 +46,21 @@ volatile int modePressed = 0;
 volatile int modeCD = 0;
 int stspp = 0;
 
+// set clock index
+volatile int index = 0;
+volatile int currentSetValue = 0;
+volatile int setValue[10] = {0};
+volatile uint32_t setResult = 0;
+volatile bool setNewTime = false;
+
+// set clock toggle
+bool toggle = false;
+int toggleTimer = 0;
+
+// GMT
+int GMTOffset = 0;
+bool setGMT = false;
+
 #define CLOCK_SPEED 16000000
 
 // auto sleep
@@ -47,78 +68,51 @@ volatile int secs = 0;
 bool sleep = false;
 
 void setup () {
+  Serial.begin(115200);
+
   // multiplex shift register pins
   pinMode(latchPin, OUTPUT);
   pinMode(clockPin, OUTPUT);
   pinMode(dataPin, OUTPUT);
-  pinMode(OE, OUTPUT);
 
   // segment shift register pins
   pinMode(latch2, OUTPUT);
   pinMode(clock2, OUTPUT);
   pinMode(data2, OUTPUT);
-
+  pinMode(OE, OUTPUT);
 
   // make sure segment register isn't outputing
   digitalWrite(OE, HIGH);
 
   // set appropriate pullups
-  pinMode(3, INPUT_PULLUP);
+  pinMode(swp, INPUT_PULLUP);
   pinMode(ststp, INPUT_PULLUP);
   pinMode(mode, INPUT_PULLUP);
 
-
-  digitalWrite(latchPin, LOW);
-  shiftOut(dataPin, clockPin, MSBFIRST, 0);
-  digitalWrite(latchPin, HIGH);
-  digitalWrite(latchPin, LOW);
-  shiftOut(dataPin, clockPin, MSBFIRST, 1);
-  digitalWrite(latchPin, HIGH);
-
-  // switch dataPin to INPUT so it doesn't mess up with the feedback loop
-  pinMode(dataPin, INPUT);
-  Serial.begin(19200);
-
   lamptest();
 
+  // set up ints
   noInterrupts();
   attachInterrupt(digitalPinToInterrupt(mode), modeChange, FALLING);
-  attachInterrupt(digitalPinToInterrupt(3), khz, RISING);
+  attachInterrupt(digitalPinToInterrupt(swp), khz, RISING);
   interrupts();
+
+  // for rtc
+  Wire.begin();
 
   // if rtc does not start, halt
   if (! rtc.begin()) {
     Serial.println("rtc not found");
     while (1);
-
-  }
-  if (EEPROM.read(4) == 0)
-  {
-    uint32_t toAdjust = DateTime(F(__DATE__), F(__TIME__)).unixtime() + 8;
-    rtc.adjust(DateTime(toAdjust));
-    EEPROM.write(4, 1);
   }
 
-  if (rtc.lostPower()) {
-    // Set date to last stored in EEPROM
-    unsigned long ftime = 0;
+  // try not to blow up the capacitor
+  rtc.disableTrickleCharge();
 
-    for (int i = 3; i >= 0; i--)
-    {
-      ftime <<= 8;
-      ftime |= EEPROM.read(i);
-    }
-    rtc.adjust(DateTime(ftime));
-  }
-
-  rtc.writeSqwPinMode(DS3231_OFF);
-
-
-  // Set dispMode to 0 incase it is magically 1
-  if (dispMode)
-  {
-    dispMode = 0;
-  }
+  // don't increment stopwatch
+  rtc.disableClockOut();
+  rtc.setBackupSwitchoverMode(1);
+  millies = 0;
 
   // auto sleep
 
@@ -132,7 +126,6 @@ void setup () {
   TCCR1A = 0;
   TCCR1B = 0;
   TCCR1C = 0;
-
 
   // set compare register
   // number of /1024 pulses for 1HZ
@@ -156,57 +149,413 @@ void setup () {
   sei();
 }
 
-// auto sleep
-// handle cmp interuppt
-ISR(TIMER1_COMPA_vect) {
-  secs++;
+void loop () {
+  //rtc.updateTime();
+  if (dispMode == 0)
+    displayNum(rtc.getUNIX());
+  else if (dispMode == 1)
+    displayHex(rtc.getUNIX());
+  else if (dispMode == 2)
+    displayMMDDYYYY();
+  else if (dispMode == 3) {
+    rtc.updateTime();
+    displayHHMMSSA();
+  } else if (dispMode == 4) {
+    if (reset == 1) {
+      if (stopping == 1)
+        startStop();
+      millies = 0;
+      stp = 0;
+      dispMode = 0;
+      reset = 0;
+    }
 
-  // sleep after 30 secs
-  if (secs > 9) {
-    secs = 0;
+    if (digitalRead(4) == LOW) {
+      if (!stspp) {
+        startStop();
+        stspp = 1;
+        wait = 20;
+      }
+    }
 
-    // reset the LCDs
-    lampclear();
+    if (stspp) {
+      wait--;
+    }
 
-    // sleep
-    noInterrupts();          // make sure we don't get interrupted before we sleep
-    sleep_enable();          // enables the sleep bit in the mcucr register
-    sleep = true;           // set so we know to not change the mode
-    modePressed = 1; // debounce
-    modeCD = 25;
-    interrupts();           // interrupts allowed now, next instruction WILL be executed
-    sleep_cpu();            // here the device is put to sleep
+    if (wait == 0)
+      stspp = 0;
+
+    displayStop();
+  } else if (dispMode == 5) {
+    if (toggleTimer == 0) {
+      toggle = !toggle;
+      toggleTimer = 10;
+    } else {
+      toggleTimer--;
+    }
+
+    displayDigit(index, currentSetValue, toggle);
+
+    if (digitalRead(ststp) == LOW) {
+      if (stspp == 0) {
+        if (currentSetValue == 9)
+          currentSetValue = 0;
+        else
+          currentSetValue = currentSetValue + 1;
+
+        stspp = 1;
+        wait = 15;
+      }
+    }
+
+    if (stspp)
+      wait--;
+    if (wait == 0) {
+      stspp = 0;
+    }
+  } else if (dispMode == 6) {
+    if (toggleTimer == 0) {
+      toggle = !toggle;
+      toggleTimer = 10;
+    } else {
+      toggleTimer--;
+    }
+
+    displayGMT(GMTOffset, toggle);
+
+    if (digitalRead(ststp) == LOW) {
+      if (stspp == 0) {
+        if (GMTOffset == 9)
+          GMTOffset = 0;
+        else
+          GMTOffset = GMTOffset + 1;
+
+        stspp = 1;
+        wait = 15;
+      }
+    }
+
+    if (stspp)
+      wait--;
+    if (wait == 0) {
+      stspp = 0;
+    }
+  }
+
+  if (modePressed) {
+    modeCD--;
+  }
+
+  if (modeCD == 0) {
+    modePressed = 0;
+  }
+
+  if (setNewTime == true) {
+    uint32_t UNIX = 1234567890;
+    if (rtc.setUNIX(setResult) == false) {
+      Serial.println("Something went wrong setting the time");
+    }
+    rtc.updateTime();
+    setNewTime = !setNewTime;
+    dispMode = 6;
+  }
+
+  if (setGMT == true) {
+    TimeChangeRule rule = {"LOCAL", Second, Sun, Mar, 2, -(60 * GMTOffset)};
+    Timezone zone(rule, rule);
+    time_t utc = rtc.getUNIX();
+    time_t local = zone.toLocal(utc);
+
+    Serial.println(utc);
+    Serial.println(local);
+    Serial.println(year(local));
+
+    if (rtc.setTime(second(local) + 1, minute(local), hour(local), weekday(local), day(local), month(local), year(local)) == false)
+      Serial.println("Something went wrong setting the time");
+
+    rtc.updateTime();
+
+    setGMT = !setGMT;
+    dispMode = 0;
   }
 }
 
-void modeChange()
-{
+void modeChange() {
   // if sleeping, wakeup
   sleep_disable();
 
   // don't change the mode if awaking
   if (sleep == true) {
     sleep = false;
-    return;
   }
-  
+
   if (!modePressed) {
     secs = 0;
-    //Serial.write("modepressed\n");
 
-    if (dispMode == 4) {
-      //reset = 1;
+    int read = digitalRead(ststp);
+    if (read == LOW) {
+      dispMode = 5;
+      stspp = 1;
+      wait = 20;
+    } else if (dispMode == 4) {
       dispMode = 0;
+    } else if (dispMode == 5) {
+      if (index == 9) {
+        setValue[index] = currentSetValue;
+
+        setResult = 0;
+        for (int i = 0; i < 10; i++) {
+          setResult *= 10;
+          setResult += setValue[i];
+        }
+
+        setNewTime = true;
+
+        index = 0;
+      } else {
+        setValue[index] = currentSetValue;
+        currentSetValue = 0;
+        index++;
+      }
+    } else if (dispMode == 6) {
+      setGMT = true;
     } else {
       dispMode++;
     }
+
     modePressed = 1;
     modeCD = 25;
   }
 }
 
-int lookup(int i)
-{
+void startStop() {
+  if (stopping == 0)
+  {
+    stopping = 1;
+    rtc.enableClockOut(FD_CLKOUT_8192);
+  }
+  else
+  {
+    stopping = 0;
+    rtc.disableClockOut();
+    //rtc.writeSqwPinMode(DS3231_OFF);
+  }
+}
+
+void displayNum(uint32_t t) {
+  int x = 9;
+  while (x >= 0)
+  {
+    unix[x] = t % 10;
+    t /= 10;
+    x--;
+  }
+  for (int i = 0; i < 10; i++)
+  {
+    digitalWrite(latch2, LOW);
+    shiftOut(data2, clock2, LSBFIRST, lookup(unix[i]));
+    digitalWrite(latch2, HIGH);
+    flash();
+    pulse();
+  }
+}
+
+void displayDigit(int position, int num, bool toggle) {
+  int i = 0;
+
+  for (i = 0; i < position; i++) {
+    shiftData(lookup(setValue[i]));
+    flash();
+    pulse();
+  }
+
+  if (toggle)
+    shiftData(0xFF);
+  else
+    shiftData(lookup(num));
+  flash();
+  pulse();
+
+  for (i = 10 - position - 1; i > 0; i--) {
+    shiftData(0xFF);
+    flash();
+    pulse();
+  }
+}
+
+void displayGMT(int offset, bool toggle) {
+  int i = 0;
+
+  for (i = 0; i < 7; i++) {
+    shiftData(0xFF);
+    flash();
+    pulse();
+  }
+
+  shiftData(lookupHex('g'));
+  flash();
+  pulse();
+
+  shiftData(lookupHex('-'));
+  flash();
+  pulse();
+
+  if (toggle)
+    shiftData(0xFF);
+  else
+    shiftData(lookup(GMTOffset));
+  flash();
+  pulse();
+}
+
+void displayHex(uint32_t t) {
+  Serial.println(t);
+  // one-zero-L
+  sprintf(hex, "%10lx", t);
+  Serial.println(hex);
+  
+  for (int i = 0; i < 10; i++)
+  {
+    shiftData(lookupHex(hex[i]));
+    flash();
+    pulse();
+  }
+}
+
+void displayMMDDYYYY() {
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookup(rtc.getMonth() / 10));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookup(rtc.getMonth() % 10));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookupHex('-'));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookup(rtc.getDate() / 10));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookup(rtc.getDate() % 10));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, lookupHex('-'));
+  digitalWrite(latch2, HIGH);
+  flash();
+  pulse();
+
+  int currentYear = rtc.getYear();
+
+  for (int x = 0; x < 4; x++)
+  {
+    yr[x] = currentYear % 10;
+    currentYear /= 10;
+  }
+
+  for (int i = 3; i >= 0; i--)
+  {
+    digitalWrite(latch2, LOW);
+    shiftOut(data2, clock2, LSBFIRST, lookup(yr[i]));
+    digitalWrite(latch2, HIGH);
+    flash();
+    pulse();
+  }
+}
+
+void displayHHMMSSA() {
+  pulse();
+
+  int hour = 33;
+
+  if (rtc.getHours() > 12)
+    hour = rtc.getHours() - 12;
+  else if (rtc.getHours() == 0)
+    hour = 12;
+  else
+    hour = rtc.getHours();
+
+  shiftData(lookup(hour / 10));
+  flash();
+  pulse();
+
+  shiftData(lookup(hour % 10));
+  flash();
+  pulse();
+
+  shiftData(lookupHex('-'));
+  flash();
+  pulse();
+
+  shiftData(lookup(rtc.getMinutes() / 10));
+  flash();
+  pulse();
+
+  shiftData(lookup(rtc.getMinutes() % 10));
+  flash();
+  pulse();
+
+  shiftData(lookupHex('-'));
+  flash();
+  pulse();
+
+  shiftData(lookup(rtc.getSeconds() / 10));
+  flash();
+  pulse();
+
+  shiftData(lookup(rtc.getSeconds() % 10));
+  flash();
+  pulse();
+
+  if (rtc.getHours() > 12)
+    shiftData(lookupHex('p'));
+  else
+    shiftData(lookupHex('a'));
+
+  flash();
+  pulse();
+}
+
+void displayStop() {
+  //Serial.println(stp);
+  long junk = stp;
+  int x = 0;
+  for (int x = 0; x < 9; x++)
+  {
+    stopA[x] = junk % 10;
+    junk /= 10;
+  }
+
+  for (int i = 8; i >= 0; i--)
+  {
+    if (i == 0)
+      shiftData(lookup(stopA[i]) - 1);
+    else
+      shiftData(lookup(stopA[i]));
+
+    flash(); int ledPin = 13;
+
+    pulse();
+  }
+
+  shiftData(lookup(millies / 819));
+  flash();
+  pulse();
+
+}
+
+int lookup(int i) {
   switch (i) {
     case 0:
       return 3;
@@ -231,8 +580,7 @@ int lookup(int i)
   }
 }
 
-int lookupHex(char i)
-{
+int lookupHex(char i) {
   switch (i) {
     case '0':
       return 3;
@@ -266,181 +614,107 @@ int lookupHex(char i)
       return 97;
     case 'f':
       return 113;
+    case 'g':
+      return 67;
     case '-':
       return 253;
     case 'p':
       return 49;
+    default:
+      return 3;
   }
 }
 
-void displayHex(uint32_t t)
-{
-  //clock 2 times
-  pulse();
-  pulse();
-  sprintf(hex, "%lx", t);
-
-  for (int i = 0; i < 8; i++)
-  {
-    shiftData(lookupHex(hex[i]));
-
-    flash();
-    pulse();
-  }
-}
-
-void startStop()
-{
-  if (stopping == 0)
-  {
-    stopping = 1;
-    //rtc.writeSqwPinMode(DS3231_SquareWave1Hz);
-    //rtc.writeSqwPinMode(DS3231_SquareWave1kHz);
-    //rtc.writeSqwPinMode(DS3231_SquareWave4kHz);
-    //rtc.writeSqwPinMode(DS3231_SquareWave8kHz);
-    rtc.writeSqwPinMode(DS3231_SquareWave8kHz);
-  }
-  else
-  {
-    stopping = 0;
-    rtc.writeSqwPinMode(DS3231_OFF);
-  }
-}
-
-void shiftData(int x)
-{
+void shiftData(int x) {
   digitalWrite(latch2, LOW);
   shiftOut(data2, clock2, LSBFIRST, x);
   digitalWrite(latch2, HIGH);
 }
 
-void displayHHMMSSA(DateTime n)
-{
-  pulse();
+int pulseCount = 9;
 
-  int hour = 33;
-
-  if (n.hour() > 12)
-    hour = n.hour() - 12;
-  else if (n.hour() == 0)
-    hour = 12;
-  else
-    hour = n.hour();
-
-  shiftData(lookup(hour / 10));
-  flash();
-  pulse();
-
-  shiftData(lookup(hour % 10));
-  flash();
-  pulse();
-
-  shiftData(lookupHex('-'));
-  flash();
-  pulse();
-
-  shiftData(lookup(n.minute() / 10));
-  flash();
-  pulse();
-
-  shiftData(lookup(n.minute() % 10));
-  flash();
-  pulse();
-
-  shiftData(lookupHex('-'));
-  flash();
-  pulse();
-
-  shiftData(lookup(n.second() / 10));
-  flash();
-  pulse();
-
-  shiftData(lookup(n.second() % 10));
-  flash();
-  pulse();
-
-  if (n.hour() > 12)
-    shiftData(lookupHex('p'));
-  else
-    shiftData(lookupHex('a'));
-
-  flash();
-  pulse();
-}
-
-void displayMMDDYYYY(DateTime n)
-{
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookup(n.month() / 10));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookup(n.month() % 10));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookupHex('-'));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookup(n.day() / 10));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookup(n.day() % 10));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-
-  digitalWrite(latch2, LOW);
-  shiftOut(data2, clock2, LSBFIRST, lookupHex('-'));
-  digitalWrite(latch2, HIGH);
-  flash();
-  pulse();
-
-  int currentYear = n.year();
-
-  for (int x = 0; x < 4; x++)
-  {
-    yr[x] = currentYear % 10;
-    currentYear /= 10;
-  }
-
-  for (int i = 3; i >= 0; i--)
-  {
-    digitalWrite(latch2, LOW);
-    shiftOut(data2, clock2, LSBFIRST, lookup(yr[i]));
-    digitalWrite(latch2, HIGH);
-    flash();
-    pulse();
+void pulse() {
+  if (pulseCount == 9) {
+    digitalWrite(latchPin, LOW);
+    shiftOut(dataPin, clockPin, MSBFIRST, 1);
+    digitalWrite(dataPin, LOW);
+    digitalWrite(latchPin, HIGH);
+    pulseCount = 0;
+  } else {
+    pulseMultiplexer();
+    pulseCount++;
   }
 }
 
-void pulse()
-{
+void pulseMultiplexer() {
   digitalWrite(latchPin, LOW);
   digitalWrite(clockPin, HIGH);
   digitalWrite(clockPin, LOW);
   digitalWrite(latchPin, HIGH);
 }
 
-void flash()
-{
+void flash() {
   digitalWrite(OE, LOW);
-  delay(1);
+  //delay(1);
+
+  for (int i = 0; i < 2200; i++)
+    NOP;
+
+  digitalWrite(OE, HIGH);
+}
+
+void lamptest() {
+  // this is test method 1, all 1s in multiplex
+
+  // shift all 0s into segement register
+  digitalWrite(latch2, LOW);
+  shiftOut(data2, clock2, LSBFIRST, 0);
+  digitalWrite(latch2, HIGH);
+
+  // shift all 1s into multiplex register
+  digitalWrite(latchPin, LOW);
+  shiftOut(dataPin, clockPin, MSBFIRST, 255);
+  shiftOut(dataPin, clockPin, MSBFIRST, 255);
+  digitalWrite(latchPin, HIGH);
+
+  // display
+  digitalWrite(OE, LOW);
+  delay(200);
   digitalWrite(OE, HIGH);
 
+  // test 2, multiplexing the shift register
+
+  // clear multiplex register
+  digitalWrite(latchPin, LOW);
+  shiftOut(dataPin, clockPin, MSBFIRST, 0);
+  shiftOut(dataPin, clockPin, MSBFIRST, 0);
+  digitalWrite(latchPin, HIGH);
+
+  // slowly multiplex
+  digitalWrite(OE, LOW);
+  delay(10);
+  for (int i = 0; i < 20; ++i) {
+    pulse();
+    delay(10);
+  }
+  digitalWrite(OE, HIGH);
+  pulse();
+}
+
+void lampclear() {
+  for (int x = 0; x < 10; x++) {
+    digitalWrite(latch2, LOW);
+    shiftOut(data2, clock2, LSBFIRST, 0xFF);
+    digitalWrite(latch2, HIGH);
+    flash();
+    pulse();
+  }
 }
 
 void khz() {
   //Serial.println(millies);
   millies++;
-  if (millies % 32000 == 0)
+  if (millies % 8192 == 0)
   {
     //Serial.println(stp);
     stp++;
@@ -448,134 +722,26 @@ void khz() {
   }
 }
 
-void displayNum(uint32_t t)
-{
-  int x = 9;
-  while (x >= 0)
-  {
-    unix[x] = t % 10;
-    t /= 10;
-    x--;
-  }
-  for (int i = 0; i < 10; i++)
-  {
+// auto sleep
+// handle cmp interuppt
+ISR(TIMER1_COMPA_vect) {
+  if (dispMode != 4)
+    secs++;
 
-    //Serial.println(lookup(unix[i]));
-    digitalWrite(OE, HIGH);
-    digitalWrite(latch2, LOW);
-    shiftOut(data2, clock2, LSBFIRST, lookup(unix[i]));
-    digitalWrite(latch2, HIGH);
-    flash();
-    pulse();
-  }
-}
+  // sleep after 30 secs
+  if (secs > 30) {
+    secs = 0;
 
-void displayStop()
-{
-  //Serial.println(stp);
-  long junk = stp;
-  int x = 0;
-  for (int x = 0; x < 9; x++)
-  {
-    stopA[x] = junk % 10;
-    junk /= 10;
-  }
+    // reset the LCDs
+    lampclear();
 
-  for (int i = 8; i >= 0; i--)
-  {
-    if (i == 0)
-      shiftData(lookup(stopA[i]) - 1);
-    else
-      shiftData(lookup(stopA[i]));
-
-    flash(); int ledPin = 13;
-
-    pulse();
-  }
-  //Serial.println(millies / 320);
-  shiftData(lookup(millies / 3200));
-  flash();
-  pulse();
-
-}
-
-void lamptest() {
-  //Serial.println("lamp testing...");
-  for (int i = 0; i < 200; i++)
-  {
-    for (int x = 0; x < 10; x++)
-    {
-      //Serial.println(lookup(unix[i]));
-      digitalWrite(OE, HIGH);
-      digitalWrite(latch2, LOW);
-      shiftOut(data2, clock2, LSBFIRST, 0);
-      digitalWrite(latch2, HIGH);
-      flash();
-      pulse();
-    }
-  }
-}
-
-void lampclear() {
-  //Serial.println("lamp testing...");
-  for (int i = 0; i < 200; i++)
-  {
-    for (int x = 0; x < 10; x++)
-    {
-      //Serial.println(lookup(unix[i]));
-      digitalWrite(OE, HIGH);
-      digitalWrite(latch2, LOW);
-      shiftOut(data2, clock2, LSBFIRST, 0xFF);
-      digitalWrite(latch2, HIGH);
-      flash();
-      pulse();
-    }
-  }
-}
-
-void loop () {
-  DateTime now = rtc.now();
-  //Serial.println(now.unixtime());
-  if (dispMode == 0)
-    displayNum(now.unixtime() + 25200);
-  else if (dispMode == 1)
-    displayHex(now.unixtime() + 25200);
-  else if (dispMode == 2)
-    displayMMDDYYYY(now);
-  else if (dispMode == 3)
-    displayHHMMSSA(now);
-  else if (dispMode == 4)
-  {
-    if (reset == 1)
-    {
-      if (stopping == 1)
-        startStop();
-      millies = 0;
-      stp = 0;
-      dispMode = 0;
-      reset = 0;
-    }
-    if (digitalRead(4) == LOW) {
-      if (!stspp) {
-        startStop();
-        stspp = 1;
-        wait = 20;
-      }
-    }
-    if (stspp) {
-      wait--;
-    }
-    if (wait == 0)
-      stspp = 0;
-
-    displayStop();
-  }
-
-  if (modePressed)
-  {
-    modeCD--;
-  }
-  if (modeCD == 0) {
-    modePressed = 0;
+    // sleep
+    noInterrupts();          // make sure we don't get interrupted before we sleep
+    sleep_enable();          // enables the sleep bit in the mcucr register
+    sleep = true;           // set so we know to not change the mode
+    modePressed = 1; // debounce
+    modeCD = 25;
+    interrupts();           // interrupts allowed now, next instruction WILL be executed
+    sleep_cpu();            // here the device is put to sleep
   }
 }
