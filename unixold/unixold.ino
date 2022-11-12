@@ -4,6 +4,8 @@
 #include <Timezone.h>    // https://github.com/JChristensen/Timezone
 #include <avr/sleep.h>
 #include <RV-3028-C7.h>
+#include "TimeZones.h"
+#include <math.h>
 RV3028 rtc;
 
 #define NOP __asm__ __volatile__ ("nop\n\t")
@@ -58,8 +60,9 @@ bool toggle = false;
 int toggleTimer = 0;
 
 // GMT
-int GMTOffset = 0;
+volatile double GMTOffset = TimeZones::getCurrent();
 bool setGMT = false;
+
 
 #define CLOCK_SPEED 16000000
 
@@ -150,6 +153,7 @@ void setup () {
 }
 
 void loop () {
+  //Serial.println(GMTOffset);
   //rtc.updateTime();
   if (dispMode == 0)
     displayNum(rtc.getUNIX());
@@ -221,14 +225,11 @@ void loop () {
       toggleTimer--;
     }
 
-    displayGMT(GMTOffset, toggle);
+    displayGMT(toggle);
 
     if (digitalRead(ststp) == LOW) {
       if (stspp == 0) {
-        if (GMTOffset == 9)
-          GMTOffset = 0;
-        else
-          GMTOffset = GMTOffset + 1;
+        GMTOffset = TimeZones::getNext();
 
         stspp = 1;
         wait = 15;
@@ -261,7 +262,9 @@ void loop () {
   }
 
   if (setGMT == true) {
-    TimeChangeRule rule = {"LOCAL", Second, Sun, Mar, 2, -(60 * GMTOffset)};
+    TimeChangeRule rule = {"LOCAL", Second, Sun, Mar, 2, (int) (60 * GMTOffset)};
+    //Serial.println(60*GMTOffset);
+    //TimeChangeRule rule = {"LOCAL", Second, Sun, Mar, 2, 0};
     Timezone zone(rule, rule);
     time_t utc = rtc.getUNIX();
     time_t local = zone.toLocal(utc);
@@ -383,10 +386,10 @@ void displayDigit(int position, int num, bool toggle) {
   }
 }
 
-void displayGMT(int offset, bool toggle) {
+void displayGMT(bool toggle) {
   int i = 0;
 
-  for (i = 0; i < 7; i++) {
+  for (i = 0; i < 5; i++) {
     shiftData(0xFF);
     flash();
     pulse();
@@ -396,24 +399,47 @@ void displayGMT(int offset, bool toggle) {
   flash();
   pulse();
 
-  shiftData(lookupHex('-'));
+  if (GMTOffset < 0)
+    shiftData(lookupHex('-'));
+  else
+    shiftData(0xFF);
+  flash();
+  pulse();
+
+  int posOffset = abs(GMTOffset);
+  int digitTwo = posOffset % 10;
+  int digitOne = posOffset / 10;
+
+  if (toggle || digitOne == 0)
+    shiftData(0xFF);
+  else
+    shiftData(lookup(digitOne));
   flash();
   pulse();
 
   if (toggle)
     shiftData(0xFF);
   else
-    shiftData(lookup(GMTOffset));
+    shiftData(lookup(digitTwo) & 0xFE);
+  flash();
+  pulse();
+
+  if (toggle)
+    shiftData(0xFF);
+  else
+    shiftData(lookup((int)(fabs(GMTOffset) * 10) % 10));
   flash();
   pulse();
 }
+
+#if 1
 
 void displayHex(uint32_t t) {
   Serial.println(t);
   // one-zero-L
   sprintf(hex, "%10lx", t);
   Serial.println(hex);
-  
+
   for (int i = 0; i < 10; i++)
   {
     shiftData(lookupHex(hex[i]));
@@ -518,7 +544,9 @@ void displayHHMMSSA() {
   flash();
   pulse();
 
-  if (rtc.getHours() > 12)
+  Serial.println(rtc.getHours());
+
+  if (rtc.getHours() >= 12)
     shiftData(lookupHex('p'));
   else
     shiftData(lookupHex('a'));
@@ -554,6 +582,8 @@ void displayStop() {
   pulse();
 
 }
+
+#endif
 
 int lookup(int i) {
   switch (i) {
@@ -620,6 +650,8 @@ int lookupHex(char i) {
       return 253;
     case 'p':
       return 49;
+    case '.':
+      return 254;
     default:
       return 3;
   }
